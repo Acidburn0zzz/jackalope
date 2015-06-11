@@ -2,14 +2,17 @@
 
 namespace Jackalope\Version;
 
+use Jackalope\Property;
 use Jackalope\Session;
 use Jackalope\Transport\AddNodeOperation;
 use Jackalope\Transport\WritingInterface;
 use PHPCR\InvalidItemStateException;
 use PHPCR\NodeInterface;
+use PHPCR\PropertyInterface;
 use PHPCR\PropertyType;
 use PHPCR\UnsupportedRepositoryOperationException;
 use PHPCR\Util\UUIDHelper;
+use PHPCR\Version\OnParentVersionAction;
 use PHPCR\Version\VersionException;
 
 /**
@@ -65,8 +68,8 @@ class VersionHandler
         $versionStorageNode = $session->getNode('/jcr:system/jcr:versionStorage');
         $versionHistory = $versionStorageNode->addNode($node->getIdentifier(), 'nt:versionHistory');
         $versionHistory->setProperty('jcr:uuid', UUIDHelper::generateUUID());
-        $additionalOperations[] = new AddNodeOperation($versionHistory->getPath(), $versionHistory);
         $versionHistory->setProperty('jcr:versionableUuid', $node->getIdentifier());
+        $additionalOperations[] = new AddNodeOperation($versionHistory->getPath(), $versionHistory);
 
         // TODO Set jcr:copiedFrom if needed
 
@@ -74,12 +77,15 @@ class VersionHandler
         $additionalOperations[] = new AddNodeOperation($versionLabels->getPath(), $versionLabels);
         $rootVersion = $versionHistory->addNode('jcr:rootVersion', 'nt:version');
         $rootVersion->setProperty('jcr:uuid', UUIDHelper::generateUUID());
+        $rootVersion->setProperty('jcr:predecessors', array(), PropertyType::REFERENCE);
+        // not part of the specification, but seems to be required
+        $rootVersion->setProperty('jcr:successors', array(), PropertyType::REFERENCE);
         $additionalOperations[] = new AddNodeOperation($rootVersion->getPath(), $rootVersion);
 
         // TODO add frozen node to root version
 
         $node->setProperty('jcr:versionHistory', $versionHistory);
-        $node->setProperty('jcr:baseVersion', $rootVersion); // TODO set correct base version
+        $node->setProperty('jcr:baseVersion', $rootVersion);
         $node->setProperty('jcr:predecessors', array($rootVersion));
 
         return $additionalOperations;
@@ -103,14 +109,19 @@ class VersionHandler
         }
 
         if ($node->isModified()) {
-            throw new InvalidItemStateException(sprintf(
-                'Node "%s" contains unsaved changes',
-                $path
-            ));
+            throw new InvalidItemStateException(
+                sprintf(
+                    'Node "%s" contains unsaved changes',
+                    $path
+                )
+            );
         }
 
+        $baseVersionUuid = $node->getProperty('jcr:baseVersion')->getString();
+        $baseVersionNode = $this->objectManager->getNodeByIdentifier($baseVersionUuid, 'Version\Version');
+
         if (!$node->isCheckedOut()) {
-            return $path;
+            return $baseVersionNode->getPath();
         }
 
         if ($node->hasProperty('jcr:mergeFailed')) {
@@ -119,27 +130,50 @@ class VersionHandler
 
         // TODO set subgraph to read only
 
-        $versionHistoryNode = $node->getPropertyValue('jcr:versionHistory');
+        /** @var NodeInterface $versionHistoryNode */
+        $versionHistoryUuid = $node->getProperty('jcr:versionHistory')->getString();
+        $versionHistoryNode = $this->objectManager->getNodeByIdentifier($versionHistoryUuid, 'Version\VersionHistory');
 
         // FIXME add some kind of sharding
         // should avoid to have too many nodes on the same level
         $versionNode = $versionHistoryNode->addNode(UUIDHelper::generateUUID(), 'nt:version');
         $versionNode->setProperty('jcr:uuid', UUIDHelper::generateUUID());
         $versionNode->setProperty('jcr:created', new \DateTime());
+        $versionNode->setProperty('jcr:successors', array());
 
-        // TODO create frozen node
+        $this->createFrozenNode($versionNode, $node);
 
-        $versionNode->setProperty('jcr:predecessors', $node->getProperty('jcr:predecessors')->getString());
-        $node->setProperty('jcr:predecessors', array(), PropertyType::REFERENCE, false);
-        foreach ($versionNode->getProperty('jcr:predecessors') as $predecessorUuid) {
-            $predecessor = $this->objectManager->getNodeByIdentifier($predecessorUuid);
-            $predecessor->setProperty('jcr:successors', array_merge($predecessor->getPropertyValueWithDefault('jcr:successors', array()), array($versionNode)));
+        $baseVersionNode->setProperty('jcr:successors', array($versionNode), PropertyType::REFERENCE, false);
+        $baseVersionNode->setModified();
+        $versionNode->setProperty(
+            'jcr:predecessors',
+            $node->getProperty('jcr:predecessors')->getString(),
+            PropertyType::REFERENCE
+        );
+        $versionNode->setProperty(
+            'jcr:successors',
+            array(),
+            PropertyType::REFERENCE,
+            false
+        );
+
+        $node->setProperty(
+            'jcr:predecessors',
+            array($versionNode),
+            PropertyType::REFERENCE,
+            false
+        );
+
+        foreach ($versionNode->getPropertyValueWithDefault('jcr:predecessors', array()) as $predecessorNode) {
+            /** @var NodeInterface $predecessorNode */
+            $successorProperty = $predecessorNode->getProperty('jcr:successors');
+            $successorProperty->addValue($versionNode);
+            $predecessorNode->setModified();
         }
 
-        // TODO change base version
-
         $node->setProperty('jcr:isCheckedOut', false, PropertyType::BOOLEAN, false);
-
+        $node->setProperty('jcr:baseVersion', $versionNode, PropertyType::REFERENCE, false);
+        $node->setModified();
         $this->session->save();
 
         return $versionNode->getPath();
@@ -167,11 +201,49 @@ class VersionHandler
         }
 
         $node->setProperty('jcr:isCheckedOut', true, PropertyType::BOOLEAN, false);
+        $node->setModified();
 
         // TODO unset read only from subgraph
 
         // TODO add base version to predecessors
 
         $this->session->save();
+    }
+
+    /**
+     * Attaches a nt:frozenNode copy of $node to $versionNode
+     *
+     * @param NodeInterface $versionNode The version to attach the nt:frozenNode to
+     * @param NodeInterface $node The node to be copied into an nt:frozenNode
+     */
+    private function createFrozenNode(NodeInterface $versionNode, NodeInterface $node)
+    {
+        $frozenNode = $versionNode->addNode('jcr:frozenNode', 'nt:frozenNode');
+        $frozenNode->setProperty('jcr:frozenUuid', $node->getProperty('jcr:uuid'));
+        $frozenNode->setProperty('jcr:frozenPrimaryType', $node->getProperty('jcr:primaryType'));
+        if ($frozenNode->hasProperty('jcr:mixinTypes')) {
+            $frozenNode->setProperty('jcr:frozenMixinTypes', $node->getProperty('jcr:mixinTypes'));
+        }
+
+        foreach ($node->getProperties() as $property) {
+            /** @var PropertyInterface $property */
+            $propertyName = $property->getName();
+            if ($propertyName == 'jcr:primaryType'
+                || $propertyName == 'jcr:mixinTypes'
+                || $propertyName == 'jcr:uuid'
+            ) {
+                continue;
+            }
+
+            $onParentValue = $property->getDefinition()->getOnParentVersion();
+            if ($onParentValue != OnParentVersionAction::COPY && $onParentValue != OnParentVersionAction::VERSION) {
+                continue;
+            }
+
+            // TODO apply other steps based on onParentValue
+            // (see step 6 3.13.9 on http://www.day.com/specs/jcr/2.0/3_Repository_Model.html)
+
+            $frozenNode->setProperty($propertyName, $property->getValue());
+        }
     }
 }
